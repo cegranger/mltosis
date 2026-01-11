@@ -12,3 +12,8 @@ test = ["pytest>=8", "numpy>=1.26"]
 keras3 = ["keras>=3,<4", "tensorflow-cpu>=2.16", "hgq2"]
 keras2 = ["tf_keras"]
 dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+  "ignore:__array__ implementation doesn't accept a copy keyword.*:DeprecationWarning",
+]

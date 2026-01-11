@@ -931,3 +931,331 @@ def conv2d_split(
         return submodels, combiner
 
     raise ValueError(f"Unknown split_type: {split_type!r}")
+
+
+def _infer_input_shape(layer, input_shape=None) -> tuple[int, ...]:
+    if input_shape is not None:
+        return tuple(input_shape)
+
+    # Prefer connected graph shape
+    try:
+        x = layer.input
+        shp = tuple(x.shape)[1:]
+        return shp
+    except Exception:
+        pass
+
+    shp = getattr(layer, "input_shape", None)
+    if shp is not None:
+        return tuple(shp)[1:] if shp and shp[0] is None else tuple(shp)
+
+    raise ValueError(
+        "Could not infer input_shape. Pass input_shape=(H, W, C) or (C, H, W)."
+    )
+
+
+def _clone_layer(layer, **overrides):
+    cfg = layer.get_config()
+    cfg.update(overrides)
+    return layer.__class__.from_config(cfg)
+
+
+def _np(x):
+    return keras.ops.convert_to_numpy(x)
+
+
+def _normalized_weight_key(layer, w) -> str:
+    # "conv/kernel:0" -> "kernel:0"
+    # "conv/kernel_quantizer/scale:0" -> "kernel_quantizer/scale:0"
+    name = w.name
+    prefix = layer.name + "/"
+    if name.startswith(prefix):
+        return name[len(prefix):]
+    return name.split("/", 1)[-1]
+
+
+def _assign_sliced_like(
+    src_layer,
+    dst_layer,
+    *,
+    out_range: tuple[int, int] | None,
+    in_range: tuple[int, int] | None,
+    kernel_axis_in: int = 2,   # (kh, kw, in_c, out_c)
+    kernel_axis_out: int = 3,
+):
+    # Require kernel
+    if not hasattr(src_layer, "kernel") or not hasattr(dst_layer, "kernel"):
+        raise ValueError("Layer must expose .kernel to be split.")
+
+    src_kernel = _np(src_layer.kernel)
+    kh, kw, in_c, out_c = src_kernel.shape
+
+    # 1) Kernel
+    dst_kernel = src_kernel
+    if in_range is not None:
+        s, e = in_range
+        dst_kernel = dst_kernel[:, :, s:e, :]
+    if out_range is not None:
+        s, e = out_range
+        dst_kernel = dst_kernel[:, :, :, s:e]
+    dst_layer.kernel.assign(dst_kernel)
+
+    # 2) Bias
+    src_use_bias = bool(getattr(src_layer, "use_bias", False))
+    dst_use_bias = bool(getattr(dst_layer, "use_bias", False))
+    if src_use_bias and dst_use_bias:
+        src_bias = _np(src_layer.bias)
+        dst_bias = src_bias
+        if out_range is not None:
+            s, e = out_range
+            dst_bias = dst_bias[s:e]
+        dst_layer.bias.assign(dst_bias)
+
+    # 3) Extra weights (quantizer params etc.)
+    # Try to match by normalized name and copy/slice if needed.
+    src_map = {_normalized_weight_key(src_layer, w): w for w in src_layer.weights}
+
+    for w_dst in dst_layer.weights:
+        key = _normalized_weight_key(dst_layer, w_dst)
+        w_src = src_map.get(key, None)
+        if w_src is None:
+            continue
+
+        if w_dst is dst_layer.kernel or (hasattr(dst_layer, "bias") and w_dst is dst_layer.bias):
+            continue
+
+        a_src = _np(w_src)
+        a_dst_shape = tuple(w_dst.shape)
+
+        if tuple(a_src.shape) == a_dst_shape:
+            w_dst.assign(a_src)
+            continue
+
+        # Attempt to slice along an axis that looks like out_c / in_c
+        # (common for per-channel quantizer scales/clip values).
+        sliced = None
+
+        def _try_slice(arr, want_shape, dim_full, dim_part, r):
+            if r is None:
+                return None
+            s, e = r
+            if arr.ndim != len(want_shape):
+                return None
+            axes = [ax for ax, (sd, dd) in enumerate(zip(arr.shape, want_shape)) if sd == dim_full and dd == dim_part]
+            if not axes:
+                return None
+            ax = axes[-1]  # choose last matching axis
+            sl = [slice(None)] * arr.ndim
+            sl[ax] = slice(s, e)
+            out = arr[tuple(sl)]
+            return out if tuple(out.shape) == tuple(want_shape) else None
+
+        # Prefer out-channel slicing, then in-channel slicing
+        if out_range is not None:
+            s, e = out_range
+            sliced = _try_slice(a_src, a_dst_shape, out_c, (e - s), out_range)
+        if sliced is None and in_range is not None:
+            s, e = in_range
+            sliced = _try_slice(a_src, a_dst_shape, in_c, (e - s), in_range)
+
+        if sliced is not None:
+            w_dst.assign(sliced)
+            continue
+        # else: leave dst weight at its initialized value
+
+
+def qconv2d_split(
+    qconv,
+    split_type: SplitType,
+    partitions: int | tuple[int, int],
+    *,
+    input_shape=None,
+    name_prefix: str | None = None,
+) -> tuple[list[keras.Model], keras.Model]:
+    """
+    Split an HGQ2-style QConv2D layer into submodels + a combiner that reconstructs
+    the original output tensor.
+
+    Assumptions:
+      - layer exposes .kernel with shape (kh, kw, in_c, out_c) (Keras Conv2D convention)
+      - layer has Conv2D-like config fields: filters, strides, dilation_rate, padding, data_format, use_bias, groups
+
+    Returns:
+      (submodels, combiner_model)
+    """
+    if not hasattr(qconv, "kernel"):
+        raise TypeError("qconv2d_split expects a Conv2D-like layer exposing .kernel")
+
+    if not getattr(qconv, "built", False):
+        raise ValueError("Layer must be built (weights created) before splitting.")
+
+    groups = int(getattr(qconv, "groups", 1))
+    if groups != 1:
+        raise NotImplementedError("qconv2d_split currently supports groups=1 only.")
+
+    prefix = name_prefix or getattr(qconv, "name", "qconv")
+    data_format = getattr(qconv, "data_format", None) or "channels_last"
+    ch_axis = _channel_axis(data_format)
+    h_axis, w_axis = _height_width_axes(data_format)
+
+    in_shape = _infer_input_shape(qconv, input_shape=input_shape)
+
+    kernel = _np(qconv.kernel)
+    kh, kw, in_c, out_c = kernel.shape
+
+    strides = tuple(getattr(qconv, "strides", (1, 1)))
+    dilation = tuple(getattr(qconv, "dilation_rate", (1, 1)))
+    sh, sw = strides
+    dh, dw = dilation
+    k_eff_h = (kh - 1) * dh + 1
+    k_eff_w = (kw - 1) * dw + 1
+
+    # ---------- Split by output filters ----------
+    if split_type == "filters":
+        if not isinstance(partitions, int):
+            raise TypeError("partitions must be int for split_type='filters'")
+        ranges = _partition_1d(out_c, partitions)
+
+        submodels: list[keras.Model] = []
+        comb_inputs = []
+
+        for i, (s, e) in enumerate(ranges):
+            x_in = keras.Input(shape=in_shape, name=f"{prefix}.in.{i}")
+
+            # clone with reduced filters
+            part = _clone_layer(qconv, filters=(e - s), name=f"{prefix}.filters.{i}")
+            y = part(x_in)
+
+            # assign sliced weights (kernel/bias + extra weights if possible)
+            _assign_sliced_like(qconv, part, out_range=(s, e), in_range=None)
+
+            submodels.append(keras.Model(x_in, y, name=f"{prefix}.sub.{i}"))
+            comb_inputs.append(keras.Input(shape=tuple(y.shape)[1:], name=f"{prefix}.comb_in.{i}"))
+
+        y_out = keras.layers.Concatenate(axis=ch_axis, name=f"{prefix}.combine.concat")(comb_inputs)
+        combiner = keras.Model(comb_inputs, y_out, name=f"{prefix}.combiner")
+        return submodels, combiner
+
+    # ---------- Split by input channels (kernel split) ----------
+    if split_type == "in_channels":
+        if not isinstance(partitions, int):
+            raise TypeError("partitions must be int for split_type='in_channels'")
+        ranges = _partition_1d(in_c, partitions)
+
+        submodels = []
+        comb_inputs = []
+
+        for i, (s, e) in enumerate(ranges):
+            x_in = keras.Input(shape=in_shape, name=f"{prefix}.in.{i}")
+
+            # slice input channels
+            def _slice_channels(x, s=s, e=e):
+                if data_format == "channels_last":
+                    return x[:, :, :, s:e]
+                return x[:, s:e, :, :]
+
+            x_part = keras.layers.Lambda(_slice_channels, name=f"{prefix}.slice_inch.{i}")(x_in)
+
+            # Bias must be added exactly once. Put it only in the first partition.
+            use_bias_i = bool(getattr(qconv, "use_bias", False)) and (i == 0)
+
+            part = _clone_layer(
+                qconv,
+                use_bias=use_bias_i,
+                name=f"{prefix}.inch.{i}",
+            )
+            y = part(x_part)
+
+            _assign_sliced_like(qconv, part, out_range=None, in_range=(s, e))
+
+            submodels.append(keras.Model(x_in, y, name=f"{prefix}.sub.{i}"))
+            comb_inputs.append(keras.Input(shape=tuple(y.shape)[1:], name=f"{prefix}.comb_in.{i}"))
+
+        y_out = keras.layers.Add(name=f"{prefix}.combine.add")(comb_inputs)
+        combiner = keras.Model(comb_inputs, y_out, name=f"{prefix}.combiner")
+        return submodels, combiner
+
+    # ---------- Spatial tiling splits ----------
+    if split_type in {"spatial_h", "spatial_w", "spatial_hw"}:
+        if isinstance(partitions, int):
+            if split_type == "spatial_h":
+                parts_h, parts_w = partitions, 1
+            elif split_type == "spatial_w":
+                parts_h, parts_w = 1, partitions
+            else:
+                parts_h, parts_w = partitions, partitions
+        else:
+            if split_type != "spatial_hw":
+                raise TypeError("tuple partitions only valid for split_type='spatial_hw'")
+            parts_h, parts_w = partitions
+
+        if data_format == "channels_last":
+            h_in, w_in, _ = in_shape
+        else:
+            _, h_in, w_in = in_shape
+        if h_in is None or w_in is None:
+            raise ValueError(
+                "Spatial splits require static input H/W. Pass input_shape with concrete H and W."
+            )
+
+        padding = (getattr(qconv, "padding", "valid") or "valid").lower()
+        if padding not in {"same", "valid"}:
+            raise NotImplementedError(f"Unsupported padding for spatial split: {padding!r}")
+
+        h_out = _conv2d_output_dim(h_in, k_eff_h, sh, padding)
+        w_out = _conv2d_output_dim(w_in, k_eff_w, sw, padding)
+
+        h_ranges = _partition_1d(h_out, parts_h)
+        w_ranges = _partition_1d(w_out, parts_w)
+
+        submodels: list[keras.Model] = []
+        comb_inputs: list[keras.KerasTensor] = []
+
+        tile_idx = 0
+        for hi, (oh0, oh1) in enumerate(h_ranges):
+            for wi, (ow0, ow1) in enumerate(w_ranges):
+                x_in = keras.Input(shape=in_shape, name=f"{prefix}.in.{tile_idx}")
+
+                # Important: keep SAME config (padding, etc.) so internal HGQ weights match
+                part = _clone_layer(qconv, name=f"{prefix}.tile.{hi}.{wi}")
+                y_full = part(x_in)
+
+                # Now we can copy all weights safely (same input shape => same internal weight shapes)
+                part.set_weights(qconv.get_weights())
+
+                # Slice the OUTPUT tile
+                def _slice_out(y, oh0=oh0, oh1=oh1, ow0=ow0, ow1=ow1):
+                    if data_format == "channels_last":
+                        return y[:, oh0:oh1, ow0:ow1, :]
+                    return y[:, :, oh0:oh1, ow0:ow1]
+
+                y_tile = keras.layers.Lambda(_slice_out, name=f"{prefix}.slice_out.{hi}.{wi}")(y_full)
+
+                submodels.append(keras.Model(x_in, y_tile, name=f"{prefix}.sub.{tile_idx}"))
+                comb_inputs.append(
+                    keras.Input(shape=tuple(y_tile.shape)[1:], name=f"{prefix}.comb_in.{tile_idx}")
+                )
+                tile_idx += 1
+
+        # Stitch tiles back
+        row_tensors = []
+        idx = 0
+        for hi in range(len(h_ranges)):
+            row = comb_inputs[idx : idx + len(w_ranges)]
+            idx += len(w_ranges)
+            if len(row) == 1:
+                row_tensors.append(row[0])
+            else:
+                row_tensors.append(
+                    keras.layers.Concatenate(axis=w_axis, name=f"{prefix}.combine.row{hi}")(row)
+                )
+
+        if len(row_tensors) == 1:
+            stitched = row_tensors[0]
+        else:
+            stitched = keras.layers.Concatenate(axis=h_axis, name=f"{prefix}.combine.col")(row_tensors)
+
+        combiner = keras.Model(comb_inputs, stitched, name=f"{prefix}.combiner")
+        return submodels, combiner
+
+    raise ValueError(f"Unknown split_type: {split_type!r}")

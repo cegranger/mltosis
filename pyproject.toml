@@ -1,0 +1,14 @@
+[project]
+name = "mltosis"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "numpy>=1.26"]
+keras3 = ["keras>=3,<4", "tensorflow-cpu>=2.16", "hgq2"]
+keras2 = ["tf_keras"]
+dev = ["pytest>=8"]

@@ -2,14 +2,15 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from collections import defaultdict
-from typing import Iterable, Union
+from typing import Iterable, Union, Literal, Sequence
 
 import keras
+import math
 import hgq
 
 LayerId = Union[int, str]
-
 
 def _is_input_layer(layer: keras.layers.Layer) -> bool:
     # Keras 3 InputLayer type exists; keep it soft in case backends differ
@@ -540,3 +541,393 @@ def qdense_split(
 
     return sub_models
 
+
+SplitType = Literal["filters", "in_channels", "spatial_h", "spatial_w", "spatial_hw"]
+
+
+def _partition_1d(n: int, parts: int) -> list[tuple[int, int]]:
+    if parts <= 0:
+        raise ValueError("parts must be >= 1")
+    if n <= 0:
+        raise ValueError("n must be >= 1")
+    if parts > n:
+        raise ValueError(f"Cannot partition length {n} into {parts} non-empty parts")
+
+    base = n // parts
+    rem = n % parts
+    ranges = []
+    start = 0
+    for i in range(parts):
+        size = base + (1 if i < rem else 0)
+        end = start + size
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _conv2d_output_dim(
+    in_dim: int, k_eff: int, stride: int, padding: str
+) -> int:
+    if padding == "valid":
+        return (in_dim - k_eff) // stride + 1
+    if padding == "same":
+        return math.ceil(in_dim / stride)
+    raise NotImplementedError(f"Unsupported padding: {padding!r}")
+
+
+@dataclass(frozen=True)
+class _SamePadding:
+    top: int
+    bottom: int
+    left: int
+    right: int
+
+
+def _compute_same_padding_2d(
+    h_in: int, w_in: int, k_eff_h: int, k_eff_w: int, sh: int, sw: int
+) -> _SamePadding:
+    h_out = math.ceil(h_in / sh)
+    w_out = math.ceil(w_in / sw)
+
+    pad_h = max(0, (h_out - 1) * sh + k_eff_h - h_in)
+    pad_w = max(0, (w_out - 1) * sw + k_eff_w - w_in)
+
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+    return _SamePadding(top, bottom, left, right)
+
+
+def _infer_input_shape_for_layer(layer: keras.layers.Layer, input_shape=None) -> tuple[int, ...]:
+    if input_shape is not None:
+        return tuple(input_shape)
+
+    # Try connected layer first
+    try:
+        x = layer.input
+        if x is not None and getattr(x, "shape", None) is not None:
+            shp = tuple(x.shape)[1:]
+            if all(s is not None for s in shp):
+                return shp
+            return shp  # may include None; caller can decide
+    except Exception:
+        pass
+
+    # Try input_shape property (may exist)
+    shp = getattr(layer, "input_shape", None)
+    if shp is not None:
+        if isinstance(shp, (list, tuple)) and shp and isinstance(shp[0], (list, tuple)):
+            # multi-input layer; not supported here
+            raise ValueError("conv2d_split expects a single-input Conv2D layer")
+        return tuple(shp)[1:] if len(shp) and shp[0] is None else tuple(shp)
+
+    raise ValueError(
+        "Could not infer input shape. Pass input_shape=(H, W, C) (channels_last) "
+        "or (C, H, W) (channels_first)."
+    )
+
+
+def _clone_conv2d(layer: keras.layers.Conv2D, **overrides) -> keras.layers.Conv2D:
+    cfg = layer.get_config()
+    cfg.update(overrides)
+    return keras.layers.Conv2D.from_config(cfg)
+
+
+def _channel_axis(data_format: str) -> int:
+    return -1 if data_format == "channels_last" else 1
+
+
+def _height_width_axes(data_format: str) -> tuple[int, int]:
+    return (1, 2) if data_format == "channels_last" else (2, 3)
+
+
+class _BiasAdd(keras.layers.Layer):
+    """Adds a fixed bias vector (broadcast across spatial dims)."""
+
+    def __init__(self, bias, data_format="channels_last", name=None):
+        super().__init__(name=name)
+        self._bias_value = bias
+        self.data_format = data_format
+
+    def build(self, input_shape):
+        # Store bias as a non-trainable weight so it serializes and moves with the model.
+        b = keras.ops.convert_to_tensor(self._bias_value)
+        self.bias = self.add_weight(
+            name="bias",
+            shape=tuple(b.shape),
+            initializer="zeros",
+            trainable=False,
+        )
+        self.bias.assign(b)
+
+    def call(self, x):
+        # x: (N, H, W, C) or (N, C, H, W)
+        if self.data_format == "channels_last":
+            return x + self.bias
+        # channels_first
+        return x + keras.ops.reshape(self.bias, (1, -1, 1, 1))
+
+
+def conv2d_split(
+    conv: keras.layers.Conv2D,
+    split_type: SplitType,
+    partitions: int | tuple[int, int],
+    *,
+    input_shape=None,
+    name_prefix: str | None = None,
+) -> tuple[list[keras.Model], keras.Model]:
+    """
+    Split a Conv2D layer into multiple submodels + a combiner that reconstitutes
+    the original Conv2D output exactly.
+
+    Args:
+        conv: a built keras.layers.Conv2D (weights available).
+        split_type: "filters", "in_channels", "spatial_h", "spatial_w", "spatial_hw"
+        partitions:
+            - for "filters"/"in_channels"/"spatial_h"/"spatial_w": int
+            - for "spatial_hw": (parts_h, parts_w) or int (interpreted as square grid)
+        input_shape: optional input shape excluding batch, used especially for spatial splits.
+        name_prefix: optional naming prefix.
+
+    Returns:
+        (submodels, combiner_model)
+    """
+    if not isinstance(conv, keras.layers.Conv2D):
+        raise TypeError(f"Expected keras.layers.Conv2D, got {type(conv)!r}")
+
+    if conv.groups != 1:
+        raise NotImplementedError("conv2d_split currently supports Conv2D with groups=1 only.")
+
+    if not conv.built:
+        # We need weights to slice/copy. You can conv.build(input_shape_with_batch) beforehand.
+        raise ValueError("Conv2D layer must be built (have weights) before splitting.")
+
+    prefix = name_prefix or conv.name
+    data_format = conv.data_format or "channels_last"
+    ch_axis = _channel_axis(data_format)
+    h_axis, w_axis = _height_width_axes(data_format)
+
+    # Infer input shape (may contain None; spatial split needs concrete H/W)
+    in_shape = _infer_input_shape_for_layer(conv, input_shape=input_shape)
+
+    # Standard Keras kernel layout is (kh, kw, in_c, out_c)
+    kernel, bias = (conv.get_weights() + [None])[:2]  # bias may be missing
+    kh, kw, in_c, out_c = kernel.shape
+
+    sh, sw = conv.strides
+    dh, dw = conv.dilation_rate
+    k_eff_h = (kh - 1) * dh + 1
+    k_eff_w = (kw - 1) * dw + 1
+
+    # ---------- 1) Split by output filters ----------
+    if split_type == "filters":
+        if not isinstance(partitions, int):
+            raise TypeError("partitions must be an int for split_type='filters'")
+
+        ranges = _partition_1d(out_c, partitions)
+        submodels: list[keras.Model] = []
+        inputs = []
+
+        # Build submodels
+        for i, (s, e) in enumerate(ranges):
+            x_in = keras.Input(shape=in_shape, name=f"{prefix}.in.{i}")
+            part = _clone_conv2d(
+                conv,
+                filters=(e - s),
+                name=f"{prefix}.filters.{i}",
+            )
+            y = part(x_in)
+            # Set weights
+            part_kernel = kernel[:, :, :, s:e]
+            if conv.use_bias:
+                part_bias = bias[s:e]
+                part.set_weights([part_kernel, part_bias])
+            else:
+                part.set_weights([part_kernel])
+
+            submodels.append(keras.Model(x_in, y, name=f"{prefix}.sub.{i}"))
+            inputs.append(keras.Input(shape=tuple(y.shape)[1:], name=f"{prefix}.comb_in.{i}"))
+
+        # Combiner: concat along channel axis
+        concat = keras.layers.Concatenate(axis=ch_axis, name=f"{prefix}.combine.concat")
+        y_out = concat(inputs)
+        combiner = keras.Model(inputs=inputs, outputs=y_out, name=f"{prefix}.combiner")
+
+        return submodels, combiner
+
+    # ---------- 2) Split by input channels (kernel split) ----------
+    if split_type == "in_channels":
+        if not isinstance(partitions, int):
+            raise TypeError("partitions must be an int for split_type='in_channels'")
+        ranges = _partition_1d(in_c, partitions)
+
+        submodels = []
+        comb_inputs = []
+
+        # Conv parts: use_bias=False; add bias once in combiner if original had bias
+        for i, (s, e) in enumerate(ranges):
+            x_in = keras.Input(shape=in_shape, name=f"{prefix}.in.{i}")
+
+            # Slice input channels
+            def _slice_channels(x, s=s, e=e):
+                if data_format == "channels_last":
+                    return x[:, :, :, s:e]
+                return x[:, s:e, :, :]
+
+            x_part = keras.layers.Lambda(
+                _slice_channels, name=f"{prefix}.slice_inch.{i}"
+            )(x_in)
+
+            part = _clone_conv2d(
+                conv,
+                use_bias=False,
+                name=f"{prefix}.inch.{i}",
+            )
+            y = part(x_part)
+
+            # Set weights (slice kernel on in-channel axis)
+            part_kernel = kernel[:, :, s:e, :]
+            part.set_weights([part_kernel])
+
+            submodels.append(keras.Model(x_in, y, name=f"{prefix}.sub.{i}"))
+            comb_inputs.append(keras.Input(shape=tuple(y.shape)[1:], name=f"{prefix}.comb_in.{i}"))
+
+        added = keras.layers.Add(name=f"{prefix}.combine.add")(comb_inputs)
+        if conv.use_bias:
+            added = _BiasAdd(bias, data_format=data_format, name=f"{prefix}.combine.bias")(added)
+
+        combiner = keras.Model(inputs=comb_inputs, outputs=added, name=f"{prefix}.combiner")
+        return submodels, combiner
+
+    # ---------- 3) Spatial tiling splits (exact output tiling) ----------
+    if split_type in {"spatial_h", "spatial_w", "spatial_hw"}:
+        if isinstance(partitions, int):
+            parts_h = parts_w = partitions if split_type == "spatial_hw" else None
+            if split_type == "spatial_h":
+                parts_h, parts_w = partitions, 1
+            elif split_type == "spatial_w":
+                parts_h, parts_w = 1, partitions
+            elif split_type == "spatial_hw":
+                parts_h, parts_w = partitions, partitions
+        else:
+            if split_type != "spatial_hw":
+                raise TypeError("tuple partitions is only valid for split_type='spatial_hw'")
+            parts_h, parts_w = partitions
+
+        # Need concrete H/W to compute output tiling
+        if data_format == "channels_last":
+            h_in, w_in, _ = in_shape
+        else:
+            _, h_in, w_in = in_shape
+
+        if h_in is None or w_in is None:
+            raise ValueError(
+                "Spatial splits require static input height/width. "
+                "Pass input_shape with concrete H and W."
+            )
+
+        padding = conv.padding.lower()
+        if padding not in {"same", "valid"}:
+            raise NotImplementedError(f"Unsupported padding for spatial split: {padding!r}")
+
+        # Compute output H/W
+        h_out = _conv2d_output_dim(h_in, k_eff_h, sh, padding)
+        w_out = _conv2d_output_dim(w_in, k_eff_w, sw, padding)
+
+        # Convert implicit padding='same' to explicit ZeroPadding2D + padding='valid'
+        if padding == "same":
+            pad = _compute_same_padding_2d(h_in, w_in, k_eff_h, k_eff_w, sh, sw)
+            pad_layer = keras.layers.ZeroPadding2D(
+                padding=((pad.top, pad.bottom), (pad.left, pad.right)),
+                data_format=data_format,
+                name=f"{prefix}.pad",
+            )
+        else:
+            pad = _SamePadding(0, 0, 0, 0)
+            pad_layer = keras.layers.Identity(name=f"{prefix}.pad")
+
+        # Conv clone with padding='valid' (since we explicitly padded if needed)
+        conv_valid = _clone_conv2d(conv, padding="valid", name=f"{prefix}.conv_valid")
+
+        # Build + set weights once (we'll clone per-submodel to avoid layer-sharing issues)
+        # We will create a fresh conv_valid per tile so weights are copied, not shared.
+        # (Sharing is possible but can be annoying with serialization / testing.)
+
+        # Partition OUTPUT space
+        h_ranges = _partition_1d(h_out, parts_h)
+        w_ranges = _partition_1d(w_out, parts_w)
+
+        submodels = []
+        tile_inputs_for_combiner = []
+        tile_output_shapes = []
+
+        tile_index = 0
+        for hi, (oh0, oh1) in enumerate(h_ranges):
+            for wi, (ow0, ow1) in enumerate(w_ranges):
+                # Required input region on PADDED input for this output tile:
+                # ih0 = oh0*sh
+                # ih1 = (oh1-1)*sh + k_eff_h
+                ih0 = oh0 * sh
+                ih1 = (oh1 - 1) * sh + k_eff_h
+                iw0 = ow0 * sw
+                iw1 = (ow1 - 1) * sw + k_eff_w
+
+                x_in = keras.Input(shape=in_shape, name=f"{prefix}.in.{tile_index}")
+                x_pad = pad_layer(x_in)
+
+                def _slice_hw(x, ih0=ih0, ih1=ih1, iw0=iw0, iw1=iw1):
+                    if data_format == "channels_last":
+                        return x[:, ih0:ih1, iw0:iw1, :]
+                    return x[:, :, ih0:ih1, iw0:iw1]
+
+                x_tile = keras.layers.Lambda(_slice_hw, name=f"{prefix}.slice.{hi}.{wi}")(x_pad)
+
+                # Fresh conv for this tile
+                part_conv = _clone_conv2d(conv, padding="valid", name=f"{prefix}.tileconv.{hi}.{wi}")
+                y_tile = part_conv(x_tile)
+
+                # Copy weights from original conv
+                if conv.use_bias:
+                    part_conv.set_weights([kernel, bias])
+                else:
+                    part_conv.set_weights([kernel])
+
+                submodels.append(keras.Model(x_in, y_tile, name=f"{prefix}.sub.{tile_index}"))
+
+                out_shape = tuple(y_tile.shape)[1:]
+                tile_output_shapes.append(out_shape)
+                tile_inputs_for_combiner.append(
+                    keras.Input(shape=out_shape, name=f"{prefix}.comb_in.{tile_index}")
+                )
+
+                tile_index += 1
+
+        # Combiner: stitch tiles back.
+        # Row-major order: for each hi, concatenate across width, then concatenate rows across height.
+        # (Axes depend on data_format.)
+        row_tensors = []
+        idx = 0
+        for hi in range(len(h_ranges)):
+            row = tile_inputs_for_combiner[idx : idx + len(w_ranges)]
+            idx += len(w_ranges)
+            if len(row) == 1:
+                row_tensors.append(row[0])
+            else:
+                row_tensors.append(
+                    keras.layers.Concatenate(axis=w_axis, name=f"{prefix}.combine.row{hi}")(row)
+                )
+
+        if len(row_tensors) == 1:
+            stitched = row_tensors[0]
+        else:
+            stitched = keras.layers.Concatenate(axis=h_axis, name=f"{prefix}.combine.col")(row_tensors)
+
+        combiner = keras.Model(
+            inputs=tile_inputs_for_combiner,
+            outputs=stitched,
+            name=f"{prefix}.combiner",
+        )
+        return submodels, combiner
+
+    raise ValueError(f"Unknown split_type: {split_type!r}")

@@ -692,6 +692,15 @@ def conv2d_split(
 
     Returns:
         (submodels, combiner_model)
+
+    Warning:
+        ``split_type="in_channels"`` is only exact when ``conv`` has a linear activation.
+        Each submodel is cloned from the original config, activation included, and the
+        combiner only sums the partial outputs and adds the bias. With a built-in
+        non-linear activation (e.g. ``activation="relu"``) the result is
+        ``relu(a) + relu(b)`` instead of ``relu(a + b)``. Put the activation in a separate
+        ``keras.layers.Activation`` layer. TODO: strip the activation from the submodels
+        and apply it in the combiner after the Add + bias (as ``dense_split`` does).
     """
     if not isinstance(conv, keras.layers.Conv2D):
         raise TypeError(f"Expected keras.layers.Conv2D, got {type(conv)!r}")
@@ -1082,6 +1091,13 @@ def qconv2d_split(
 
     Returns:
       (submodels, combiner_model)
+
+    Warning:
+      ``split_type="in_channels"`` is only exact when the layer has a linear activation and
+      no output quantization inside the layer: each submodel would apply the activation
+      and/or round its partial sum before the combiner adds them. Use a separate activation
+      layer. TODO: move the activation (and output quantization) to the combiner, or raise
+      an explicit error for these layers.
     """
     if not hasattr(qconv, "kernel"):
         raise TypeError("qconv2d_split expects a Conv2D-like layer exposing .kernel")

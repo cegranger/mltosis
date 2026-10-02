@@ -693,14 +693,13 @@ def conv2d_split(
     Returns:
         (submodels, combiner_model)
 
-    Warning:
-        ``split_type="in_channels"`` is only exact when ``conv`` has a linear activation.
-        Each submodel is cloned from the original config, activation included, and the
-        combiner only sums the partial outputs and adds the bias. With a built-in
-        non-linear activation (e.g. ``activation="relu"``) the result is
-        ``relu(a) + relu(b)`` instead of ``relu(a + b)``. Put the activation in a separate
-        ``keras.layers.Activation`` layer. TODO: strip the activation from the submodels
-        and apply it in the combiner after the Add + bias (as ``dense_split`` does).
+    Note:
+        With ``split_type="in_channels"`` each submodel computes a partial convolution
+        over a slice of the input channels with a linear activation; the bias is kept
+        only in the first submodel. The combiner sums the partial outputs and then applies
+        the original activation (``act(a + b + bias)``, as ``dense_split`` does with
+        ``axis=0``). Before v0.1.1 the activation was kept in every submodel, which gave
+        ``act(a) + act(b)`` for a non-linear activation.
     """
     if not isinstance(conv, keras.layers.Conv2D):
         raise TypeError(f"Expected keras.layers.Conv2D, got {type(conv)!r}")
@@ -774,7 +773,8 @@ def conv2d_split(
         submodels = []
         comb_inputs = []
 
-        # Conv parts: use_bias=False; add bias once in combiner if original had bias
+        # Conv parts are partial sums: linear activation (applied after the sum, in the
+        # combiner, as dense_split does) and the bias is added exactly once, in the first part.
         for i, (s, e) in enumerate(ranges):
             x_in = keras.Input(shape=in_shape, name=f"{prefix}.in.{i}")
 
@@ -788,25 +788,36 @@ def conv2d_split(
                 _slice_channels, name=f"{prefix}.slice_inch.{i}"
             )(x_in)
 
+            use_bias_i = bool(conv.use_bias) and (i == 0)
             part = _clone_conv2d(
                 conv,
-                use_bias=False,
+                use_bias=use_bias_i,
+                activation=None,
                 name=f"{prefix}.inch.{i}",
             )
             y = part(x_part)
 
             # Set weights (slice kernel on in-channel axis)
             part_kernel = kernel[:, :, s:e, :]
-            part.set_weights([part_kernel])
+            if use_bias_i:
+                part.set_weights([part_kernel, bias])
+            else:
+                part.set_weights([part_kernel])
 
             submodels.append(keras.Model(x_in, y, name=f"{prefix}.sub.{i}"))
             comb_inputs.append(keras.Input(shape=tuple(y.shape)[1:], name=f"{prefix}.comb_in.{i}"))
 
+        # Combiner: sum of the partial convolutions (bias already in part 0), then the
+        # original activation.
         added = keras.layers.Add(name=f"{prefix}.combine.add")(comb_inputs)
-        if conv.use_bias:
-            added = _BiasAdd(bias, data_format=data_format, name=f"{prefix}.combine.bias")(added)
+        activation_name = conv.get_config()["activation"]
+        y_out = (
+            keras.layers.Activation(activation_name, name=f"{prefix}.combine.act")(added)
+            if activation_name not in ["linear", None]
+            else added
+        )
 
-        combiner = keras.Model(inputs=comb_inputs, outputs=added, name=f"{prefix}.combiner")
+        combiner = keras.Model(inputs=comb_inputs, outputs=y_out, name=f"{prefix}.combiner")
         return submodels, combiner
 
     # ---------- 3) Spatial tiling splits (exact output tiling) ----------
@@ -1092,12 +1103,14 @@ def qconv2d_split(
     Returns:
       (submodels, combiner_model)
 
-    Warning:
-      ``split_type="in_channels"`` is only exact when the layer has a linear activation and
-      no output quantization inside the layer: each submodel would apply the activation
-      and/or round its partial sum before the combiner adds them. Use a separate activation
-      layer. TODO: move the activation (and output quantization) to the combiner, or raise
-      an explicit error for these layers.
+    Note:
+      With ``split_type="in_channels"`` each submodel computes a partial convolution with a
+      linear activation and no output quantizer (``enable_oq=False``); the (quantized) bias
+      is kept only in the first submodel and the input/kernel quantizers are sliced on the
+      input-channel axis. The combiner sums the partial outputs, then applies the original
+      activation and, if the original layer had one, its output quantizer (an
+      ``hgq.layers.Quantizer`` with the same config and weights). Before v0.1.1 the
+      activation and output quantization were applied in every submodel.
     """
     if not hasattr(qconv, "kernel"):
         raise TypeError("qconv2d_split expects a Conv2D-like layer exposing .kernel")
@@ -1175,11 +1188,12 @@ def qconv2d_split(
             # Bias must be added exactly once. Put it only in the first partition.
             use_bias_i = bool(getattr(qconv, "use_bias", False)) and (i == 0)
 
-            part = _clone_layer(
-                qconv,
-                use_bias=use_bias_i,
-                name=f"{prefix}.inch.{i}",
-            )
+            # Partial sums: no activation and no output quantization in the parts,
+            # both are applied in the combiner after the sum.
+            overrides = dict(use_bias=use_bias_i, activation=None, name=f"{prefix}.inch.{i}")
+            if "enable_oq" in qconv.get_config():
+                overrides.update(enable_oq=False, oq_conf=None)
+            part = _clone_layer(qconv, **overrides)
             y = part(x_part)
 
             _assign_sliced_like(qconv, part, out_range=None, in_range=(s, e))
@@ -1187,7 +1201,15 @@ def qconv2d_split(
             submodels.append(keras.Model(x_in, y, name=f"{prefix}.sub.{i}"))
             comb_inputs.append(keras.Input(shape=tuple(y.shape)[1:], name=f"{prefix}.comb_in.{i}"))
 
+        # Combiner: sum, then original activation, then original output quantizer (if any).
         y_out = keras.layers.Add(name=f"{prefix}.combine.add")(comb_inputs)
+        activation_name = qconv.get_config().get("activation", None)
+        if activation_name not in ["linear", None]:
+            y_out = keras.layers.Activation(activation_name, name=f"{prefix}.combine.act")(y_out)
+        if getattr(qconv, "enable_oq", False):
+            oq = hgq.layers.Quantizer(qconv.oq.config, name=f"{prefix}.combine.oq")
+            y_out = oq(y_out)
+            oq.set_weights(qconv.oq.get_weights())
         combiner = keras.Model(comb_inputs, y_out, name=f"{prefix}.combiner")
         return submodels, combiner
 

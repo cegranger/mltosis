@@ -239,6 +239,46 @@ def test_qconv2d_split_in_channels_matches_original_when_safe(qconv_ctor_kwargs,
     np.testing.assert_allclose(y_rec, y_ref, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("enable_oq", [False, True])
+@pytest.mark.parametrize("partitions", [2, 3, 7])
+@pytest.mark.parametrize("padding", ["valid", "same"])
+@pytest.mark.parametrize("use_bias", [True, False])
+def test_qconv2d_split_in_channels_relu_matches_original(
+    qconv_ctor_kwargs, enable_oq, partitions, padding, use_bias
+):
+    # Regression test (v0.1.1): activation (and HGQ2 output quantizer) must be applied
+    # after the sum of the partial convolutions, in the combiner.
+    input_shape = (9, 11, 7)
+    kwargs = dict(qconv_ctor_kwargs, activation="relu", enable_oq=enable_oq)
+    qconv = _make_built_qconv(
+        input_shape=input_shape,
+        filters=8,
+        kernel_size=(3, 3),
+        padding=padding,
+        use_bias=use_bias,
+        seed=22,
+        ctor_kwargs=kwargs,
+    )
+
+    ref_model, rec_model, submodels, _ = _make_ref_and_reconstructed_models(
+        qconv, "in_channels", partitions=partitions, input_shape=input_shape
+    )
+
+    x = (np.random.default_rng(23).standard_normal((4,) + input_shape)).astype("float32")
+    y_ref = _to_numpy(ref_model(x, training=False))
+    y_rec = _to_numpy(rec_model(x, training=False))
+
+    assert len(submodels) == partitions
+    assert 0.1 < np.mean(y_ref == 0.0) < 0.9  # the ReLU is actually exercised
+    np.testing.assert_allclose(y_rec, y_ref, rtol=1e-5, atol=1e-5)
+
+    for i, sm in enumerate(submodels):
+        part = sm.layers[-1]
+        assert part.get_config()["activation"] == "linear"
+        assert not getattr(part, "enable_oq", False)
+        assert bool(part.use_bias) == (use_bias and i == 0)
+
+
 def test_qconv2d_split_spatial_h_matches_original_stride2_same(qconv_ctor_kwargs):
     input_shape = (15, 14, 4)
     qconv = _make_built_qconv(

@@ -31,6 +31,7 @@ def _make_built_conv(
     data_format="channels_last",
     groups=1,
     seed=123,
+    activation=None,
 ) -> keras.layers.Conv2D:
     keras.utils.set_random_seed(seed)
 
@@ -43,6 +44,7 @@ def _make_built_conv(
         use_bias=use_bias,
         data_format=data_format,
         groups=groups,
+        activation=activation,
         name="conv",
     )
 
@@ -148,6 +150,48 @@ def test_conv2d_split_in_channels_matches_original(use_bias):
 
     assert len(submodels) == 3
     np.testing.assert_allclose(y_rec, y_ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("activation", ["relu", "tanh"])
+@pytest.mark.parametrize("partitions", [2, 3, 7])
+@pytest.mark.parametrize("padding", ["valid", "same"])
+@pytest.mark.parametrize("use_bias", [True, False])
+def test_conv2d_split_in_channels_nonlinear_activation_matches_original(
+    activation, partitions, padding, use_bias
+):
+    # Regression test (v0.1.1): the activation must be applied after the sum of the
+    # partial convolutions (and the bias added once), i.e. act(a + b + bias),
+    # not act(a) + act(b).
+    input_shape = (9, 11, 7)
+    conv = _make_built_conv(
+        input_shape=input_shape,
+        filters=8,
+        kernel_size=(3, 3),
+        padding=padding,
+        use_bias=use_bias,
+        activation=activation,
+        seed=20,
+    )
+
+    ref_model, rec_model, submodels, combiner = _make_ref_and_reconstructed_models(
+        conv, "in_channels", partitions=partitions, input_shape=input_shape
+    )
+
+    x = (np.random.default_rng(21).standard_normal((4,) + input_shape)).astype("float32")
+    y_ref = _to_numpy(ref_model(x, training=False))
+    y_rec = _to_numpy(rec_model(x, training=False))
+
+    assert len(submodels) == partitions
+    if activation == "relu":
+        # make sure the non-linearity is actually exercised
+        assert 0.1 < np.mean(y_ref == 0.0) < 0.9
+    np.testing.assert_allclose(y_rec, y_ref, rtol=1e-5, atol=1e-5)
+
+    # Partial convolutions are linear; the bias is only in the first part.
+    for i, sm in enumerate(submodels):
+        part = sm.layers[-1]
+        assert part.get_config()["activation"] == "linear"
+        assert part.use_bias == (use_bias and i == 0)
 
 
 def test_conv2d_split_spatial_h_matches_original_stride2_same():

@@ -78,7 +78,7 @@ def _run_split_pipeline_axis1(x: np.ndarray, parts: list[keras.Model], combiner:
 @pytest.mark.parametrize("activation", ["linear", "relu"])
 def test_qdense_split_axis0_matches_original_with_remainder(activation: str):
     in_dim, units = 10, 7
-    n_parts = 3  # remainder on input split: 10 -> (3,3,4)
+    n_parts = 3  # balanced input split: 10 -> (4,3,3)
 
     model, layer = _build_qdense_model(in_dim, units, activation=activation)
     _set_deterministic_weights(layer)
@@ -100,7 +100,7 @@ def test_qdense_split_axis0_matches_original_with_remainder(activation: str):
 @pytest.mark.parametrize("activation", ["linear", "relu"])
 def test_qdense_split_axis1_matches_original_with_remainder(activation: str):
     in_dim, units = 8, 10
-    n_parts = 4  # remainder on neuron split: 10 -> (2,2,2,4)
+    n_parts = 4  # balanced neuron split: 10 -> (3,3,2,2)
 
     model, layer = _build_qdense_model(in_dim, units, activation=activation)
     _set_deterministic_weights(layer)
@@ -126,3 +126,31 @@ def test_qdense_split_rejects_invalid_axis():
 
     with pytest.raises(ValueError):
         qdense_split(layer, axis=2, number_of_partitions=2)
+
+@pytest.mark.parametrize("activation", ["linear", "relu"])
+@pytest.mark.parametrize(
+    "in_dim, units, axis, n_parts",
+    [
+        (144, 6, 0, 73),  # previously 72 x 1 + 1 x 72
+        (9, 128, 1, 43),  # previously 42 x 2 + 1 x 44
+        (9, 128, 1, 65),  # previously 64 x 1 + 1 x 64
+    ],
+)
+def test_qdense_split_balanced_partition_sizes(activation, in_dim, units, axis, n_parts):
+    model, layer = _build_qdense_model(in_dim, units, activation=activation)
+    _set_deterministic_weights(layer)
+
+    sub_models = qdense_split(layer, axis=axis, number_of_partitions=n_parts)
+    parts, combiner = sub_models[:-1], sub_models[-1]
+    assert len(parts) == n_parts
+
+    dim = in_dim if axis == 0 else units
+    sizes = [int(sm.input_shape[-1]) if axis == 0 else int(sm.output_shape[-1]) for sm in parts]
+    assert sum(sizes) == dim
+    assert max(sizes) - min(sizes) <= 1
+    assert max(sizes) == -(-dim // n_parts)  # ceil(dim / n_parts)
+
+    x = np.random.RandomState(2).randn(4, in_dim).astype("float32")
+    y_ref = _forward(model, x)
+    run = _run_split_pipeline_axis0 if axis == 0 else _run_split_pipeline_axis1
+    np.testing.assert_allclose(run(x, parts, combiner), y_ref, rtol=1e-5, atol=1e-5)

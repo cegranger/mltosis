@@ -301,16 +301,11 @@ def dense_split(
     original_weights, original_biases = layer.get_weights()
 
     sub_models = []
-    partition_size = original_weights.shape[axis] // number_of_partitions
-    for partition in range(number_of_partitions):
-        # split the weights & biases if there's a remainder, it's added to the last partition.
+    # balanced split: partition sizes differ by at most 1 (the first ones get the remainder)
+    ranges = _partition_1d(original_weights.shape[axis], number_of_partitions)
+    for partition, (start, end) in enumerate(ranges):
+        # split the weights & biases
         idx = [slice(None)] * original_weights.ndim
-        start = partition * partition_size
-        end = (
-            original_weights.shape[axis]
-            if partition == number_of_partitions - 1
-            else start + partition_size
-        )
         idx[axis] = slice(start, end)
         weights = original_weights[tuple(idx)]
 
@@ -430,12 +425,11 @@ def qdense_split(
     
     if axis == 0:
         # input split
-        partition_size = input_dim // number_of_partitions
+        # balanced split: partition sizes differ by at most 1 (the first ones get the remainder)
+        ranges = _partition_1d(input_dim, number_of_partitions)
 
-        for partition in range(number_of_partitions):
+        for partition, (start, end) in enumerate(ranges):
             new_weights = []
-            start = partition * partition_size
-            end = input_dim if partition == number_of_partitions - 1 else start + partition_size
 
             for w in og_weights:
                 if w.ndim == 0:
@@ -481,12 +475,11 @@ def qdense_split(
 
     elif axis == 1:
         # neuron split
-        partition_size = output_dim // number_of_partitions
+        # balanced split: partition sizes differ by at most 1 (the first ones get the remainder)
+        ranges = _partition_1d(output_dim, number_of_partitions)
 
-        for partition in range(number_of_partitions):
+        for partition, (start, end) in enumerate(ranges):
             new_weights = []
-            start = partition * partition_size
-            end = output_dim if partition == number_of_partitions - 1 else start + partition_size
 
             for w in og_weights:
                 if w.ndim == 0:

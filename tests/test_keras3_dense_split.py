@@ -45,7 +45,7 @@ def _run_split_pipeline_axis1(x: np.ndarray, parts: list[keras.Model], combiner:
 
 def test_dense_split_axis0_matches_original_with_remainder():
     in_dim, units = 10, 7
-    n_parts = 3  # 10 // 3 = 3 remainder 1 goes to last split (3,3,4)
+    n_parts = 3  # balanced split: (4,3,3)
 
     model, layer = _build_original_dense(in_dim, units, activation="relu")
     _set_known_weights(layer, in_dim, units)
@@ -63,7 +63,7 @@ def test_dense_split_axis0_matches_original_with_remainder():
 
 def test_dense_split_axis1_matches_original_with_remainder():
     in_dim, units = 8, 10
-    n_parts = 4  # 10 // 4 = 2 remainder 2 => (2,2,2,4)
+    n_parts = 4  # balanced split: (3,3,2,2)
 
     model, layer = _build_original_dense(in_dim, units, activation="linear")
     _set_known_weights(layer, in_dim, units)
@@ -89,3 +89,40 @@ def test_dense_split_rejects_invalid_axis():
         pass
     else:
         raise AssertionError("Expected ValueError for axis > 1")
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "in_dim, units, axis, n_parts",
+    [
+        (144, 6, 0, 73),  # 144 inputs in 73 parts: previously 72 x 1 + 1 x 72
+        (9, 128, 1, 43),  # 128 neurons in 43 parts: previously 42 x 2 + 1 x 44
+        (9, 128, 1, 100),  # previously 99 x 1 + 1 x 29
+        (10, 7, 0, 10),  # one input per part
+    ],
+)
+def test_dense_split_balanced_partition_sizes(in_dim, units, axis, n_parts):
+    model, layer = _build_original_dense(in_dim, units, activation="relu")
+    _set_known_weights(layer, in_dim, units)
+
+    sub_models = dense_split(layer, axis=axis, number_of_partitions=n_parts)
+    parts, combiner = sub_models[:-1], sub_models[-1]
+    assert len(parts) == n_parts
+
+    dim = in_dim if axis == 0 else units
+    sizes = [int(sm.input_shape[-1]) if axis == 0 else int(sm.output_shape[-1]) for sm in parts]
+    assert sum(sizes) == dim
+    assert max(sizes) - min(sizes) <= 1
+    assert max(sizes) == -(-dim // n_parts)  # ceil(dim / n_parts)
+
+    x = np.random.RandomState(1).randn(4, in_dim).astype("float32")
+    y_ref = model.predict(x, verbose=0)
+    run = _run_split_pipeline_axis0 if axis == 0 else _run_split_pipeline_axis1
+    np.testing.assert_allclose(run(x, parts, combiner), y_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_dense_split_rejects_more_partitions_than_units():
+    model, layer = _build_original_dense(4, 3)
+    with pytest.raises(ValueError):
+        dense_split(layer, axis=1, number_of_partitions=4)
